@@ -351,40 +351,38 @@ fn describe_update(
             }
         }
         UpdateResult::Skipped => {
-            details.push(match record.skip_reason {
-                Some(SkipReason::ActiveSessions) => format!(
-                    "bsk {} is available; automatic installation was postponed because agent sessions are active",
-                    record.target_version
-                ),
-                Some(SkipReason::HostManaged) => format!(
-                    "bsk {} is available; this daemon belongs to its terminal or supervisor",
-                    record.target_version
-                ),
-                Some(SkipReason::NotWritable) | None => format!(
-                    "bsk {} is available, but bsk cannot write next to {}{}",
-                    record.target_version,
-                    record.executable.display(),
-                    record
-                        .error
-                        .as_deref()
-                        .map(|error| format!(": {error}"))
-                        .unwrap_or_default()
-                ),
-            });
-            if !superseded {
-                hints.push(match record.skip_reason {
-                    Some(SkipReason::ActiveSessions) => {
-                        "the daemon retries on its next update check once sessions are idle"
-                            .to_string()
+            match record.skip_reason {
+                Some(SkipReason::ActiveSessions) => {
+                    details.push(format!("{attempt} was postponed due to session activity"));
+                    if !superseded {
+                        details
+                            .push("the daemon retries on its next update check when idle".into());
                     }
-                    Some(SkipReason::HostManaged) => {
-                        "run `bsk update`, then restart the daemon in its terminal or supervisor"
-                            .to_string()
+                }
+                Some(SkipReason::HostManaged) => {
+                    details.push(format!(
+                        "bsk {} is available; this daemon belongs to its terminal or supervisor",
+                        record.target_version
+                    ));
+                    if !superseded {
+                        hints.push("run `bsk update`, then restart the daemon in its terminal or supervisor".into());
                     }
-                    Some(SkipReason::NotWritable) | None => {
-                        update::installer_hint(&record.executable)
+                }
+                Some(SkipReason::NotWritable) | None => {
+                    details.push(format!(
+                        "bsk {} is available, but bsk cannot write next to {}{}",
+                        record.target_version,
+                        record.executable.display(),
+                        record
+                            .error
+                            .as_deref()
+                            .map(|error| format!(": {error}"))
+                            .unwrap_or_default()
+                    ));
+                    if !superseded {
+                        hints.push(update::installer_hint(&record.executable));
                     }
-                });
+                }
             }
         }
     }
@@ -958,15 +956,22 @@ mod m2_tests {
             None,
         );
         let check = update_check(Some(&record), Some("0.3.1"));
-        assert!(
-            check
-                .detail
-                .contains("postponed because agent sessions are active")
+        assert_eq!(
+            check.status,
+            CheckStatus::Ok,
+            "ordinary session deferral requires no action"
         );
-        assert!(!check.detail.contains("cannot write"));
-        let hint = check.hint.unwrap();
-        assert!(hint.contains("next update check"));
-        assert!(!hint.contains("installer or package manager"));
+        assert!(check.hint.is_none());
+        assert!(check.detail.contains("postponed") && check.detail.contains("next update check"));
+
+        let skewed = update_check(Some(&record), Some("0.3.0"));
+        assert_eq!(skewed.status, CheckStatus::Warning);
+        assert!(skewed.hint.unwrap().contains("bsk daemon restart"));
+
+        let superseded = auto_update_check(Some(&record), None, "0.3.2", &[], 1_120);
+        assert_eq!(superseded.status, CheckStatus::Ok);
+        assert!(superseded.detail.contains("postponed"));
+        assert!(!superseded.detail.contains("next update check"));
     }
 
     #[test]

@@ -69,8 +69,8 @@ impl Session {
 #[derive(Debug, Default)]
 pub struct SessionRegistry {
     audit: Option<Arc<super::audit::AuditStore>>,
-    /// Held briefly when reserving a session or claiming an idle installation.
-    updating: Mutex<bool>,
+    /// Acquired before `inner` when admitting starts, cleanup, or installation.
+    admission: Mutex<UpdateAdmission>,
     inner: Mutex<HashMap<SessionId, Session>>,
     /// Operational metadata kept outside the public `Session` wire/domain
     /// shape so idle enforcement does not break external struct users.
@@ -114,10 +114,33 @@ impl Default for SessionActivity {
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum UpdateBlocked {
-    #[error("{0} agent session(s) active")]
+    #[error("{0} agent session(s) active or being cleaned up")]
     ActiveSessions(usize),
     #[error("an automatic update is already installing")]
     Updating,
+}
+
+#[derive(Debug, Default)]
+struct UpdateAdmission {
+    installing: bool,
+    // Invisible to callers, but still owned while a cancelled plain start settles.
+    cleaning: HashSet<SessionId>,
+}
+
+struct StartCleanup<'a> {
+    registry: &'a SessionRegistry,
+    id: &'a SessionId,
+}
+
+impl Drop for StartCleanup<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .admission
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .cleaning
+            .remove(self.id);
+    }
 }
 
 /// Keeps session admission closed without holding a mutex during installation.
@@ -127,11 +150,11 @@ pub(crate) struct UpdateGuard(Arc<SessionRegistry>);
 
 impl Drop for UpdateGuard {
     fn drop(&mut self) {
-        *self
-            .0
-            .updating
+        self.0
+            .admission
             .lock()
-            .unwrap_or_else(|err| err.into_inner()) = false;
+            .unwrap_or_else(|err| err.into_inner())
+            .installing = false;
     }
 }
 
@@ -146,16 +169,24 @@ impl SessionRegistry {
         Self::default()
     }
 
+    fn blockers(&self, admission: &UpdateAdmission) -> usize {
+        self.len() + admission.cleaning.len()
+    }
+
+    pub(crate) fn update_blockers(&self) -> usize {
+        self.blockers(&self.admission.lock().expect("session admission poisoned"))
+    }
+
     pub(crate) fn try_begin_update(self: &Arc<Self>) -> Result<UpdateGuard, UpdateBlocked> {
-        let mut updating = self.updating.lock().expect("session admission poisoned");
-        if *updating {
+        let mut admission = self.admission.lock().expect("session admission poisoned");
+        if admission.installing {
             return Err(UpdateBlocked::Updating);
         }
-        let active = self.len();
+        let active = self.blockers(&admission);
         if active > 0 {
             return Err(UpdateBlocked::ActiveSessions(active));
         }
-        *updating = true;
+        admission.installing = true;
         Ok(UpdateGuard(Arc::clone(self)))
     }
 
@@ -221,7 +252,7 @@ impl SessionRegistry {
         max_attempts: u32,
         now_ms_fn: impl Fn() -> i64,
     ) -> Option<SessionId> {
-        self.reserve_id_for_start(browser_id, max_attempts, now_ms_fn)
+        self.reserve_id_for_start(browser_id, max_attempts, now_ms_fn, SessionId::random)
             .ok()
     }
 
@@ -230,18 +261,20 @@ impl SessionRegistry {
         browser_id: BrowserId,
         max_attempts: u32,
         now_ms_fn: impl Fn() -> i64,
+        mut next_id: impl FnMut() -> SessionId,
     ) -> Result<SessionId, StartSessionError> {
-        let updating = self.updating.lock().expect("session admission poisoned");
-        if *updating {
+        let admission = self.admission.lock().expect("session admission poisoned");
+        if admission.installing {
             return Err(StartSessionError::DaemonUpdating);
         }
         let mut guard = self.inner.lock().expect("session registry poisoned");
         for _ in 0..max_attempts {
-            let candidate = SessionId::random();
+            let candidate = next_id();
             // A tombstoned id still means "recently ended": reusing it
             // would immediately look like a crash/stop to clients that
             // dispatch against the old id (see `SessionEnd`).
             if guard.contains_key(&candidate)
+                || admission.cleaning.contains(&candidate)
                 || self
                     .ended
                     .lock()
@@ -293,15 +326,33 @@ impl SessionRegistry {
     /// Drop a placeholder reservation, used on extension error/timeout
     /// paths so failed reservations do not accumulate.
     pub fn cancel_reservation(&self, session_id: &SessionId) {
+        self.remove_reservation(session_id);
+    }
+
+    /// Transfer a live reservation to cleanup under the same lock used to admit
+    /// an update or reuse an id. Only the guard, not the mutex, spans the RPCs.
+    fn begin_untracked_cleanup<'a>(&'a self, id: &'a SessionId) -> Option<StartCleanup<'a>> {
+        let mut admission = self.admission.lock().expect("session admission poisoned");
+        if self.remove_reservation(id) && admission.cleaning.insert(id.clone()) {
+            Some(StartCleanup { registry: self, id })
+        } else {
+            None
+        }
+    }
+
+    fn remove_reservation(&self, session_id: &SessionId) -> bool {
         self.starting.lock().unwrap().remove(session_id);
-        self.inner
+        let removed = self
+            .inner
             .lock()
             .expect("session registry poisoned")
-            .remove(session_id);
+            .remove(session_id)
+            .is_some();
         self.last_activity
             .lock()
             .expect("session activity registry poisoned")
             .remove(session_id);
+        removed
     }
 
     pub fn remove(&self, id: &SessionId) -> Option<Session> {
@@ -737,6 +788,7 @@ pub(crate) async fn start_session_recoverable(
         client.id.clone(),
         SESSION_ID_MAX_RESERVE_ATTEMPTS,
         now_ms,
+        SessionId::random,
     )?;
     if preserve_cleanup {
         sessions.starting.lock().unwrap().insert(session_id.clone());
@@ -940,9 +992,11 @@ async fn finish_aborted_start(
     reason: StartAbortReason,
     preserve_cleanup: bool,
 ) -> StartSessionError {
-    if !preserve_cleanup {
-        sessions.cancel_reservation(session_id);
-    }
+    let _cleanup = if preserve_cleanup {
+        None
+    } else {
+        sessions.begin_untracked_cleanup(session_id)
+    };
     let cancel = Frame::Request(RequestFrame {
         id: format!("cancel-{rpc_id}"),
         method: Method::Cancel,
@@ -1285,6 +1339,15 @@ mod link_tests {
             timeout: Duration,
             preserve_cleanup: bool,
         ) -> tokio::task::JoinHandle<Result<Session, StartSessionError>> {
+            self.start_with_cancel(timeout, preserve_cleanup, None)
+        }
+
+        fn start_with_cancel(
+            &self,
+            timeout: Duration,
+            preserve_cleanup: bool,
+            cancel: Option<super::AbortToken>,
+        ) -> tokio::task::JoinHandle<Result<Session, StartSessionError>> {
             let browsers = Arc::clone(&self.browsers);
             let sessions = Arc::clone(&self.sessions);
             let queues = Arc::clone(&self.queues);
@@ -1301,7 +1364,7 @@ mod link_tests {
                     },
                     Duration::ZERO,
                     timeout,
-                    None,
+                    cancel,
                     preserve_cleanup,
                 )
                 .await
@@ -1326,6 +1389,165 @@ mod link_tests {
             Frame::Request(request) => request,
             other => panic!("expected a request, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn untracked_cleanup_blocks_installation_through_late_window_rollback() {
+        for (cancelled, rollback_ok) in [(true, true), (false, true), (true, false)] {
+            let h = Harness::new();
+            let (client, mut rx) = h.connect(Liveness::default());
+            let token = super::AbortToken::new();
+            let start = h.start_with_cancel(
+                if cancelled {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::ZERO
+                },
+                false,
+                cancelled.then(|| token.clone()),
+            );
+            let create = next_request(&mut rx).await;
+            assert_eq!(create.method, Method::ToolSessionStart);
+            if cancelled {
+                token.cancel();
+            }
+            assert_eq!(next_request(&mut rx).await.method, Method::Cancel);
+            assert!(h.sessions.snapshot().is_empty());
+            assert_eq!(h.sessions.count_for_browser(&client.id), 0);
+            assert!(
+                matches!(
+                    h.sessions.try_begin_update(),
+                    Err(super::UpdateBlocked::ActiveSessions(1))
+                ),
+                "update admitted while untracked start cancellation was settling"
+            );
+            assert_eq!(h.sessions.update_blockers(), 1);
+            answer(
+                &client,
+                &create,
+                ResponseBody::Ok(serde_json::json!({"agent_window_id":71})),
+            );
+            let stop = next_request(&mut rx).await;
+            assert_eq!(stop.method, Method::ToolSessionStop);
+            assert!(h.sessions.snapshot().is_empty());
+            assert_eq!(h.sessions.count_for_browser(&client.id), 0);
+            assert_eq!(h.sessions.update_blockers(), 1);
+            assert!(
+                matches!(
+                    h.sessions.try_begin_update(),
+                    Err(super::UpdateBlocked::ActiveSessions(1))
+                ),
+                "update admitted while the late window was being rolled back"
+            );
+            answer(
+                &client,
+                &stop,
+                if rollback_ok {
+                    ResponseBody::Ok(serde_json::json!({}))
+                } else {
+                    ResponseBody::Err(RpcError {
+                        code: ErrorCode::ProtocolError,
+                        message: "window close failed".into(),
+                        data: None,
+                    })
+                },
+            );
+            let error = start_error(start).await;
+            match (cancelled, rollback_ok, error) {
+                (true, true, StartSessionError::Cancelled)
+                | (false, true, StartSessionError::Timeout)
+                | (_, false, StartSessionError::CleanupFailed { .. }) => {}
+                other => panic!("unexpected cleanup result: {other:?}"),
+            }
+            let _admitted = h
+                .sessions
+                .try_begin_update()
+                .expect("settled cleanup must release update admission");
+        }
+    }
+
+    #[tokio::test]
+    async fn untracked_cleanup_guard_releases_on_early_exit_deadline_and_future_drop() {
+        enum Exit {
+            CancelSendFailed,
+            WaiterClosed,
+            Deadline,
+            DropFuture,
+        }
+        for exit in [
+            Exit::CancelSendFailed,
+            Exit::WaiterClosed,
+            Exit::Deadline,
+            Exit::DropFuture,
+        ] {
+            let h = Harness::new();
+            let (client, mut rx) = h.connect(Liveness::default());
+            let token = super::AbortToken::new();
+            let start = h.start_with_cancel(Duration::from_secs(30), false, Some(token.clone()));
+            assert_eq!(next_request(&mut rx).await.method, Method::ToolSessionStart);
+            if matches!(exit, Exit::CancelSendFailed) {
+                rx.close();
+            }
+            token.cancel();
+            if !matches!(exit, Exit::CancelSendFailed) {
+                assert_eq!(next_request(&mut rx).await.method, Method::Cancel);
+                assert_eq!(h.sessions.update_blockers(), 1);
+                assert!(h.sessions.is_empty());
+            }
+            match exit {
+                Exit::DropFuture => {
+                    start.abort();
+                    assert!(start.await.unwrap_err().is_cancelled());
+                }
+                Exit::WaiterClosed | Exit::CancelSendFailed => {
+                    client.pending.lock().unwrap().close();
+                    assert!(matches!(
+                        start_error(start).await,
+                        StartSessionError::TransportClosed
+                    ));
+                }
+                Exit::Deadline => {
+                    let error = tokio::time::timeout(
+                        super::CANCEL_CLEANUP_TIMEOUT + Duration::from_secs(3),
+                        start,
+                    )
+                    .await
+                    .expect("plain start cleanup must remain bounded")
+                    .unwrap()
+                    .unwrap_err();
+                    assert!(matches!(error, StartSessionError::Cancelled));
+                }
+            }
+            assert_eq!(h.sessions.update_blockers(), 0);
+            let _admitted = h
+                .sessions
+                .try_begin_update()
+                .expect("cleanup exit must reopen update admission");
+        }
+    }
+
+    #[test]
+    fn cleanup_keeps_only_its_own_id_reserved_without_exposing_a_live_session() {
+        let sessions = SessionRegistry::new();
+        let browser = BrowserId("browser".into());
+        let reserve = |id: &str| {
+            sessions.reserve_id_for_start(browser.clone(), 1, || 0, || super::SessionId(id.into()))
+        };
+        let id = reserve("aaaa").unwrap();
+        let cleanup = sessions.begin_untracked_cleanup(&id).unwrap();
+        assert!(sessions.is_empty());
+        assert_eq!(sessions.update_blockers(), 1);
+        assert!(matches!(
+            reserve("aaaa"),
+            Err(StartSessionError::IdExhausted)
+        ));
+        let other = reserve("bbbb").expect("cleanup must not refuse unrelated session starts");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions.update_blockers(), 2);
+        sessions.cancel_reservation(&other);
+        drop(cleanup);
+        assert_eq!(sessions.update_blockers(), 0);
+        assert_eq!(reserve("aaaa").unwrap(), id);
     }
 
     #[tokio::test]
@@ -1361,6 +1583,13 @@ mod link_tests {
             let harness = Harness::new();
             let (client, mut rx) = harness.connect(Liveness::default());
             let admission = harness.sessions.try_begin_update().unwrap();
+            assert!(
+                harness
+                    .sessions
+                    .reserve_id(client.id.clone(), 64, || 0)
+                    .is_none(),
+                "installation must refuse a new ID reservation"
+            );
             assert!(matches!(
                 harness.sessions.try_begin_update(),
                 Err(super::UpdateBlocked::Updating)

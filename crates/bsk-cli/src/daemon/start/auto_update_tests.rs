@@ -312,10 +312,13 @@ fn session_started_during_download_postpones_installation() {
                 let session = daemon.start(None).await;
                 assert_eq!(sessions.len(), 1);
                 release.finish();
-                assert!(matches!(
-                    prepared.await.unwrap().unwrap(),
-                    InstallOutcome::PostponedSessions(1)
-                ));
+                assert!(
+                    matches!(
+                        prepared.await.unwrap(),
+                        Ok(InstallOutcome::PostponedSessions(1))
+                    ),
+                    "installation must be postponed when a session starts during download"
+                );
                 let record = state::current().unwrap();
                 assert_eq!(record.result, state::UpdateResult::Skipped);
                 assert_eq!(record.stage, Some(state::UpdateStage::Download));
@@ -423,10 +426,29 @@ fn abandoned_update_restores_before_reopening_admission() {
                 sessions.try_begin_update(),
                 Err(UpdateBlocked::Updating)
             ));
+            let mut observed_restore = false;
             lock_slot(&installation.transaction)
                 .take()
                 .unwrap()
-                .abandon();
+                .abandon_with(|| {
+                    // This is the success callback of the real file restoration,
+                    // before roll_back returns to the transaction.
+                    assert_eq!(fs::read(&installation.exe).unwrap(), ORIGINAL);
+                    assert!(
+                        matches!(sessions.try_begin_update(), Err(UpdateBlocked::Updating)),
+                        "admission reopened before rollback completed"
+                    );
+                    assert!(
+                        sessions
+                            .reserve_id(BrowserId("during-rollback".into()), 64, || 0)
+                            .is_none()
+                    );
+                    observed_restore = true;
+                    state::Recovery::Restored {
+                        daemon_serving: false,
+                    }
+                });
+            assert!(observed_restore, "the actual restore callback must run");
             installation.restored_and_open(&sessions);
             assert_eq!(
                 state::current().unwrap().recovery,

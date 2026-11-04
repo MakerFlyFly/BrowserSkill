@@ -506,21 +506,28 @@ enum Transaction {
 impl Transaction {
     /// Undo an update this daemon stopped before handing over.
     fn abandon(self) {
-        use crate::cli::update::state::Recovery;
-        let reason = "the daemon stopped before handing over";
-        match self {
-            Transaction::HandingOver(pending, _admission) => handover::abandon(pending, reason),
+        self.abandon_with(|| crate::cli::update::state::Recovery::Restored {
+            daemon_serving: false,
+        });
+    }
+
+    fn abandon_with(self, restored: impl FnOnce() -> crate::cli::update::state::Recovery) {
+        let (installed, mut record, _admission) = match self {
+            Transaction::HandingOver(mut pending, admission) => {
+                handover::stop(&mut pending.child);
+                (pending.installed, pending.record, admission)
+            }
             Transaction::Installed(Prepared {
                 installed,
-                mut record,
-                admission: _admission,
-            }) => {
-                let recovery = installed.roll_back(|| Recovery::Restored {
-                    daemon_serving: false,
-                });
-                record.fail(&anyhow::anyhow!("handover abandoned: {reason}"), recovery);
-            }
-        }
+                record,
+                admission,
+            }) => (installed, record, admission),
+        };
+        let recovery = installed.roll_back(restored);
+        record.fail(
+            &anyhow::anyhow!("handover abandoned: the daemon stopped before handing over"),
+            recovery,
+        );
     }
 }
 
@@ -1027,7 +1034,7 @@ fn spawn_update_check_task(
                     )?;
                     // Avoid downloading while sessions are active. The installer
                     // checks again and closes admission after the download.
-                    let active_sessions = state.sessions.len();
+                    let active_sessions = state.sessions.update_blockers();
                     let last_attempt = update::state::current();
                     let outcome = update::auto_update_step(
                         candidate.as_ref(),
@@ -1115,7 +1122,7 @@ fn spawn_update_check_task(
                 update::AutoUpdateOutcome::PostponedSessions { latest, sessions } => info!(
                     %latest,
                     sessions,
-                    "auto-update postponed: agent session(s) active; will retry on the next tick"
+                    "auto-update postponed: agent session(s) active or being cleaned up; will retry on the next tick"
                 ),
                 update::AutoUpdateOutcome::Deferred { latest, until } => info!(
                     %latest,
